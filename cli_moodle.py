@@ -47,6 +47,13 @@ def _require_config(keys: list[str]) -> dict:
 # Moodle API Client
 # ---------------------------------------------------------------------------
 
+class MoodleAPIError(Exception):
+    def __init__(self, message: str, errorcode: str = ""):
+        self.message = message
+        self.errorcode = errorcode
+        super().__init__(message)
+
+
 class MoodleAPI:
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
@@ -64,8 +71,7 @@ class MoodleAPI:
         r.raise_for_status()
         data = r.json()
         if isinstance(data, dict) and "exception" in data:
-            click.echo(json.dumps({"error": data.get("message", "Unknown API error"), "errorcode": data.get("errorcode")}))
-            sys.exit(1)
+            raise MoodleAPIError(data.get("message", "Unknown API error"), data.get("errorcode", ""))
         return data
 
     def download_file(self, fileurl: str, dest: str):
@@ -396,34 +402,42 @@ def calendar(course_id, days):
 @click.option("--limit", type=int, default=20, help="Max notifications to fetch.")
 @click.option("--unread-only", is_flag=True, help="Only show unread.")
 def notifications(limit, unread_only):
-    """Get popup notifications."""
+    """Get notifications (compatible with Moodle 3.7+)."""
     api = _get_api()
     uid = _get_userid()
-    data = api.call("message_popup_get_popup_notifications",
-                    useridto=uid, newestfirst=1, limitfrom=0, limitnum=limit)
 
-    notifs = data.get("notifications", [])
-    if unread_only:
-        notifs = [n for n in notifs if not n.get("read")]
-        data["notifications"] = notifs
+    # Try modern API first, fall back to core_message_get_messages for Moodle 3.x
+    try:
+        data = api.call("message_popup_get_popup_notifications",
+                        useridto=uid, newestfirst=1, limitfrom=0, limitnum=limit)
+        notifs = data.get("notifications", [])
+        if unread_only:
+            notifs = [n for n in notifs if not n.get("read")]
+            data["notifications"] = notifs
+    except MoodleAPIError:
+        # Moodle 3.x fallback
+        data = api.call("core_message_get_messages",
+                        useridto=uid, useridfrom=0, type="notifications",
+                        read=0, limitfrom=0, limitnum=limit)
+        if not unread_only:
+            read_msgs = api.call("core_message_get_messages",
+                                 useridto=uid, useridfrom=0, type="notifications",
+                                 read=1, limitfrom=0, limitnum=limit)
+            data["messages"] = data.get("messages", []) + read_msgs.get("messages", [])
+            data["messages"].sort(key=lambda m: m.get("timecreated", 0), reverse=True)
+            data["messages"] = data["messages"][:limit]
+        notifs = data.get("messages", [])
 
     def _human(d):
-        for n in d.get("notifications", []):
-            read_mark = " " if n.get("read") else "*"
+        items = d.get("notifications", d.get("messages", []))
+        for n in items:
+            read_mark = " " if n.get("read") or n.get("timeread") else "*"
             ts = _ts(n.get("timecreated"))
-            click.echo(f"  {read_mark} [{n['id']}] {ts}  {n.get('subject', '(no subject)')}")
+            subject = n.get("subject", "(no subject)")
+            nid = n.get("id")
+            click.echo(f"  {read_mark} [{nid}] {ts}  {subject}")
 
     _out(data, _human)
-
-
-@cli.command("mark-read")
-@click.argument("notification_id", type=int)
-def mark_read(notification_id):
-    """Mark a notification as read."""
-    api = _get_api()
-    data = api.call("core_message_mark_notification_read",
-                    notificationid=notification_id, timeread=int(time.time()))
-    _out(data)
 
 
 # ---------------------------------------------------------------------------
@@ -556,16 +570,23 @@ def dashboard():
         "options[timeend]": now + 7 * 86400,
     })
 
-    # Unread notifications
-    notifs = api.call("message_popup_get_popup_notifications",
-                      useridto=uid, newestfirst=1, limitfrom=0, limitnum=5)
+    # Unread notifications (with Moodle 3.x fallback)
+    try:
+        notifs = api.call("message_popup_get_popup_notifications",
+                          useridto=uid, newestfirst=1, limitfrom=0, limitnum=5)
+        unread_notifs = [n for n in notifs.get("notifications", []) if not n.get("read")]
+    except MoodleAPIError:
+        notifs = api.call("core_message_get_messages",
+                          useridto=uid, useridfrom=0, type="notifications",
+                          read=0, limitfrom=0, limitnum=5)
+        unread_notifs = notifs.get("messages", [])
 
     # Courses
     courses = api.call("core_enrol_get_users_courses", userid=uid)
 
     result = {
         "upcoming_events": cal.get("events", []),
-        "unread_notifications": [n for n in notifs.get("notifications", []) if not n.get("read")],
+        "unread_notifications": unread_notifs,
         "enrolled_courses": [{"id": c["id"], "fullname": c["fullname"]} for c in courses],
     }
 
