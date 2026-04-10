@@ -506,8 +506,14 @@ def forums(course_id):
 def forum_discussions(forum_id, sort, limit):
     """List discussions in a forum."""
     api = _get_api()
-    data = api.call("mod_forum_get_forum_discussions",
-                    forumid=forum_id, sortby=sort, sortdirection="DESC", page=0, perpage=limit)
+    try:
+        # Moodle 3.8+：支援 sortby/sortdirection
+        data = api.call("mod_forum_get_forum_discussions",
+                        forumid=forum_id, sortby=sort, sortdirection="DESC", page=0, perpage=limit)
+    except Exception:
+        # Moodle 3.7 fallback：不支援 sortby 參數
+        data = api.call("mod_forum_get_forum_discussions",
+                        forumid=forum_id, page=0, perpage=limit)
 
     def _human(d):
         for disc in d.get("discussions", []):
